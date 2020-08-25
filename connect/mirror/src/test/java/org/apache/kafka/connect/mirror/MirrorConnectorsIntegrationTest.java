@@ -17,9 +17,13 @@
 package org.apache.kafka.connect.mirror;
 
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.Config;
+import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.util.clusters.EmbeddedConnectCluster;
 import org.apache.kafka.connect.util.clusters.EmbeddedKafkaCluster;
@@ -33,11 +37,13 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -124,7 +130,11 @@ public class MirrorConnectorsIntegrationTest {
                 "Workers of backup-connect-cluster did not start in time.");
 
         // create these topics before starting the connectors so we don't need to wait for discovery
-        primary.kafka().createTopic("test-topic-1", NUM_PARTITIONS);
+        
+        //primary.kafka().createTopic("test-topic-1", NUM_PARTITIONS);
+        Map<String, String> topicConfig = new HashMap<>();
+        topicConfig.put("cleanup.policy", "compact");
+        primary.kafka().createTopic("test-topic-1", NUM_PARTITIONS, 1, topicConfig);
         primary.kafka().createTopic("backup.test-topic-1", 1);
         primary.kafka().createTopic("heartbeats", 1);
         backup.kafka().createTopic("test-topic-1", NUM_PARTITIONS);
@@ -316,6 +326,8 @@ public class MirrorConnectorsIntegrationTest {
             primary.kafka().consume(NUM_RECORDS_PRODUCED, 2 * RECORD_TRANSFER_DURATION_MS, "backup.test-topic-3").count());
         assertEquals("New topic was not replicated to backup cluster.", NUM_RECORDS_PRODUCED,
             backup.kafka().consume(NUM_RECORDS_PRODUCED, 2 * RECORD_TRANSFER_DURATION_MS, "primary.test-topic-2").count());
+        
+        assertEquals("empty", "compact", getTopicConfig(backup.kafka(), "primary.test-topic-1", "cleanup.policy"));
     }
 
     private void waitForConsumerGroupOffsetSync(Consumer<byte[], byte[]> consumer, List<String> topics, String consumerGroupId)
@@ -418,5 +430,27 @@ public class MirrorConnectorsIntegrationTest {
             client.deleteTopics(client.listTopics().names().get());
         } catch (Throwable e) {
         }
+    }
+    
+    private String getTopicConfig(EmbeddedKafkaCluster cluster, String topic, String configName) {
+        Admin client = cluster.createAdminClient();
+        Collection<ConfigResource> cr =  Collections.singleton(new ConfigResource(ConfigResource.Type.TOPIC, topic)); 
+        try {
+            DescribeConfigsResult configsResult = client.describeConfigs(cr);
+            Config allConfigs = (Config) configsResult.all().get().values().toArray()[0];
+            Iterator configIterator = allConfigs.entries().iterator();
+            log.info("getTopicConfig");
+            while (configIterator.hasNext()) {
+                ConfigEntry currentConfig = (ConfigEntry) configIterator.next();
+                log.info("name; {}, value: {}", currentConfig.name(), currentConfig.value());
+               
+                if (currentConfig.name().equals(configName)) {
+                    return currentConfig.value();
+                }
+            }
+        } catch (Throwable e) {
+            log.info("exception: {}", e);
+        }
+        return null;
     }
 }
