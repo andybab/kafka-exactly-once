@@ -32,4 +32,12 @@ public class TestUtils {
         }
         return props;
     }
+    
+    public static Map<String, String> expectedRecords(int numRecords) {
+        Map<String, String> expectedRecords = new HashMap<>();
+        for (int i = 0; i < numRecords; i++) {
+            expectedRecords.put("key-" + i, "message-" + i);
+        }
+        return expectedRecords;
+    }
 }
