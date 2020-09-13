@@ -16,17 +16,23 @@
  */
 package org.apache.kafka.connect.mirror.integration;
 
+import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.DescribeConfigsResult;
 import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.config.SslConfigs;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.common.utils.Exit;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.mirror.MirrorMakerConfig;
 import org.apache.kafka.connect.mirror.SourceAndTarget;
 import org.apache.kafka.connect.util.clusters.EmbeddedConnectCluster;
@@ -36,6 +42,7 @@ import org.junit.experimental.categories.Category;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Collections;
@@ -43,13 +50,16 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.kafka.connect.mirror.TestUtils.expectedRecords;
 import static org.apache.kafka.connect.util.clusters.EmbeddedConnectClusterAssertions.CONNECTOR_SETUP_DURATION_MS;
 import static org.apache.kafka.test.TestUtils.waitForCondition;
+import kafka.server.KafkaConfig$;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -67,7 +77,7 @@ public class MirrorConnectorsIntegrationBaseTest {
     protected static final int RECORD_CONSUME_DURATION_MS = 20_000;
     protected static final int OFFSET_SYNC_DURATION_MS = 30_000;
     protected static final int NUM_RECORDS_PRODUCED = 100;  // to save trees
-    public static final int NUM_PARTITIONS = 10;
+    public static final int NUM_PARTITIONS = 1;
     protected static final int RECORD_TRANSFER_DURATION_MS = 20_000;
     protected static final int CHECKPOINT_DURATION_MS = 20_000;
     protected static final int NUM_WORKERS = 3;
@@ -79,22 +89,45 @@ public class MirrorConnectorsIntegrationBaseTest {
     
     private final AtomicBoolean exited = new AtomicBoolean(false);
     private Properties primaryBrokerProps = new Properties();
-    private Properties backupBrokerProps = new Properties();
+    protected Properties backupBrokerProps = new Properties();
     private Map<String, String> primaryWorkerProps;
-    private Map<String, String> backupWorkerProps;
-   
-    protected void loadMMConfig() {
-        mm2Props = basicMM2Config();
-        mm2Config = new MirrorMakerConfig(mm2Props); 
+    private Map<String, String> backupWorkerProps = new HashMap<>();
+    private Properties sslProps = new Properties();
+    
+    private void loadSslPropsFromBrokerConfig() {       
+        sslProps.put(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG, backupBrokerProps.get(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG));
+        sslProps.put(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG, ((Password) backupBrokerProps.get(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG)).value());
+        sslProps.put(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG, "SSL");
+    }
+    
+    protected void setSslConfig() {
+        // kafka connect worker
+        backupWorkerProps.putAll(sslProps.entrySet().stream().collect(Collectors.toMap(
+            e -> String.valueOf(e.getKey()), e ->  String.valueOf(e.getValue()))));
+        mm2Props.putAll(sslProps.entrySet().stream().collect(Collectors.toMap(
+            e -> "backup." + String.valueOf(e.getKey()), e ->  String.valueOf(e.getValue()))));
+        // producer used by source task in MM2
+        mm2Props.putAll(sslProps.entrySet().stream().collect(Collectors.toMap(
+            e -> "backup.producer." + String.valueOf(e.getKey()), e ->  String.valueOf(e.getValue()))));
     }
     
     protected void startClusters() throws InterruptedException {
         primaryBrokerProps.put("auto.create.topics.enable", "false");
         backupBrokerProps.put("auto.create.topics.enable", "false");
         
+        mm2Props = basicMM2Config();
+        
+        // if backup kafka cluster contains ssl config, enable ssl of kafka connect and mm2
+        final Object listeners = backupBrokerProps.get(KafkaConfig$.MODULE$.ListenersProp());
+        if (listeners != null && listeners.toString().contains("SSL")) {
+            loadSslPropsFromBrokerConfig();
+            setSslConfig();
+        }
+
+        mm2Config = new MirrorMakerConfig(mm2Props); 
         primaryWorkerProps = mm2Config.workerConfig(new SourceAndTarget("backup", "primary"));
-        backupWorkerProps = mm2Config.workerConfig(new SourceAndTarget("primary", "backup"));
-                
+        backupWorkerProps.putAll(mm2Config.workerConfig(new SourceAndTarget("primary", "backup")));
+        
         primary = new EmbeddedConnectCluster.Builder()
                 .name("primary-connect-cluster")
                 .numWorkers(3)
@@ -102,7 +135,7 @@ public class MirrorConnectorsIntegrationBaseTest {
                 .brokerProps(primaryBrokerProps)
                 .workerProps(primaryWorkerProps)
                 .build();
-        
+
         backup = new EmbeddedConnectCluster.Builder()
                 .name("backup-connect-cluster")
                 .numWorkers(3)
@@ -158,19 +191,15 @@ public class MirrorConnectorsIntegrationBaseTest {
             MirrorMakerConfig mm2Config, String primary, String backup) throws InterruptedException {
         for (int i = 0; i < connectorClasses.size(); i++) {
             String connector = connectorClasses.get(i).getSimpleName();
-            Map<String, String> map = mm2Config.connectorBaseConfig(new SourceAndTarget(primary, backup), connectorClasses.get(i));
-            log.info("map:");
-            map.entrySet().stream().forEach(x -> log.info("{}, {}", x.getKey(), x.getValue()));
-            String re = connectCluster.configureConnector(connector, mm2Config.connectorBaseConfig(new SourceAndTarget(primary, backup), 
+            connectCluster.configureConnector(connector, mm2Config.connectorBaseConfig(new SourceAndTarget(primary, backup), 
                     connectorClasses.get(i)));
-            log.info("response = {}", re);
             connectCluster.assertions().assertConnectorAndAtLeastNumTasksAreRunning(connector, 1,
                     "Connector " + connector + " tasks did not start in time on cluster: " + connectCluster);
         }
     }
  
     /*
-     * delete all topics of the kafka cluster
+     * delete all topics of the input kafka cluster
      */
     protected static void deleteAllTopics(EmbeddedKafkaCluster cluster) {
         Admin client = cluster.createAdminClient();
@@ -181,7 +210,7 @@ public class MirrorConnectorsIntegrationBaseTest {
     }
     
     /*
-     * retrieve the config value given the kafka cluster, topic name and config name
+     * retrieve the config value based on the input cluster, topic and config name
      */
     protected static String getTopicConfig(EmbeddedKafkaCluster cluster, String topic, String configName) {
         Admin client = cluster.createAdminClient();
@@ -202,12 +231,12 @@ public class MirrorConnectorsIntegrationBaseTest {
     }
     
     /*
-     * for each pair of cluster and topic, produce given number of messages
+     *  produce messages to the input topic and cluster
      */
-    protected static void produceRecords(EmbeddedConnectCluster clusters, String topic) {
+    protected static void produceRecords(EmbeddedConnectCluster cluster, String topic) {
         Map<String, String> recordSent = expectedRecords(NUM_RECORDS_PRODUCED);
         for (Map.Entry<String, String> entry : recordSent.entrySet()) {
-            clusters.kafka().produce(topic, entry.getKey(), entry.getValue());
+            cluster.kafka().produce(topic, entry.getKey(), entry.getValue());
         }
     }
     
@@ -242,10 +271,10 @@ public class MirrorConnectorsIntegrationBaseTest {
     /*
      * make sure the consumer to consume expected number of records
      */
-    protected static void waitForConsumingAllRecords(Consumer<byte[], byte[]> consumer) throws InterruptedException {
+    protected static <T> void waitForConsumingAllRecords(Consumer<T, T> consumer) throws InterruptedException {
         final AtomicInteger totalConsumedRecords = new AtomicInteger(0);
         waitForCondition(() -> {
-            ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofMillis(500));
+            ConsumerRecords<T, T> records = consumer.poll(Duration.ofMillis(500));
             return NUM_RECORDS_PRODUCED == totalConsumedRecords.addAndGet(records.count());
         }, RECORD_CONSUME_DURATION_MS, "Consumer cannot consume all records in time");
         consumer.commitSync();
@@ -323,5 +352,31 @@ public class MirrorConnectorsIntegrationBaseTest {
         backup.kafka().createTopic("test-topic-1", NUM_PARTITIONS);
         backup.kafka().createTopic("primary.test-topic-1", 1);
         backup.kafka().createTopic("heartbeats", 1);
+    }
+    
+    protected KafkaConsumer<String, String> createSslConsumer(Map<String, Object> consumerProps, String... topics) {
+        Map<String, Object> props = new HashMap<>(consumerProps);
+
+        if (props.get(ConsumerConfig.GROUP_ID_CONFIG) == null) {
+            props.put(ConsumerConfig.GROUP_ID_CONFIG, UUID.randomUUID().toString());
+        }
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, backup.kafka().bootstrapServers());
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+
+        // ssl config
+        props.putAll(sslProps.entrySet().stream().collect(Collectors.toMap(
+            e -> String.valueOf(e.getKey()), e ->  String.valueOf(e.getValue()))));
+        
+        KafkaConsumer<String, String> consumer;
+        try {
+            consumer = new KafkaConsumer<>(props);
+        } catch (Throwable t) {
+            throw new ConnectException("Failed to create consumer", t);
+        }
+        consumer.subscribe(Arrays.asList(topics));
+        return consumer;
     }
 }
